@@ -12,6 +12,7 @@ namespace NWheels.UI.ChatBot.Runtime.Dotnet
     public class Bot
     {
         private readonly ImmutableList<IChannel> _channels;
+        private readonly ImmutableList<IIntentFilter> _intentFilters;
         private readonly ImmutableList<IBulbTriggerFilter> _bulbTriggers;
         private readonly CancellationToken _cancel;
         private readonly Brain _brain;
@@ -20,17 +21,22 @@ namespace NWheels.UI.ChatBot.Runtime.Dotnet
 
         public Bot(
             IEnumerable<IChannel> channels, 
+            IEnumerable<IIntentFilter> intentFilters,
             IEnumerable<IBulbTriggerFilter> bulbTriggers)
+            : this(
+                channels.ToImmutableList(),
+                intentFilters.ToImmutableList(),
+                bulbTriggers.ToImmutableList(),
+                CancellationToken.None,
+                brain: null,
+                status: BotStatus.Off,
+                fault: null)
         {
-            _channels = channels.ToImmutableList();
-            _bulbTriggers = bulbTriggers.ToImmutableList();
-            _brain = null;
-            _fault = null;
-            _status = BotStatus.Off;
         }
 
         private Bot(
             ImmutableList<IChannel> channels, 
+            ImmutableList<IIntentFilter> intentFilters,
             ImmutableList<IBulbTriggerFilter> bulbTriggers,
             CancellationToken cancel,
             Brain brain,
@@ -38,6 +44,7 @@ namespace NWheels.UI.ChatBot.Runtime.Dotnet
             Exception fault)
         {
             _channels = channels;
+            _intentFilters = intentFilters;
             _bulbTriggers = bulbTriggers;
             _cancel = cancel;
             _brain = brain;
@@ -76,9 +83,8 @@ namespace NWheels.UI.ChatBot.Runtime.Dotnet
 
         private async Task<Bot> Init()
         {
-            return this
-                .WithBrain(new Brain())
-                .WithStatus(BotStatus.Ready);
+            var nextBrain = await InvokeBulbTriggerFilters((trigger, context) => trigger.OnInitBot(context));
+            return WithBrain(nextBrain);
         }
 
         public BotStatus Status => _status;
@@ -109,55 +115,89 @@ namespace NWheels.UI.ChatBot.Runtime.Dotnet
             var (intent, withIntent) = await withInput.PullNextIntent(input);
             var dispatched = await withIntent.DispatchIntent(intent);
             var autoDimmed = await dispatched.AutoDimBulbs();
-            var (nextBulb, scheduled) = await autoDimmed.ScheduleNextBulb();
-            var acted = await scheduled.ActUponNextBulb(nextBulb);
+            var nextBulb = await autoDimmed.ScheduleNextBulb();
+            var acted = await autoDimmed.ActUponNextBulb(nextBulb);
 
             return acted;
         }
 
         private async Task<(IInput input, Bot withInput)> PullNextInput()
         {
-            throw new NotImplementedException();
+            var allChannelPulls = _channels.Select(c => c.WaitForInput()).ToArray();
+            var pullInput = (await Task.WhenAny(allChannelPulls)).Result;
+            var input = await pullInput();
+            
+            var nextBrain = await InvokeBulbTriggerFilters((trigger, context) => trigger.OnInput(context, input));
+            var nextBot = WithBrain(nextBrain);
+
+            return (input, nextBot);
         }
 
         private async Task<(IIntent intent, Bot withIntent)> PullNextIntent(IInput input)
         {
-            throw new NotImplementedException();
+            var volunteer = _intentFilters.FirstOrDefault(filter => filter.WillAnalyzeInput(input));
+
+            if (volunteer != null)
+            {
+                var intent = await volunteer.AnalyzeInput(input);
+                
+                var nextBrain = await InvokeBulbTriggerFilters((trigger, context) => trigger.OnIntent(context, intent));
+                var nextBot = WithBrain(nextBrain);
+
+                return (intent, nextBot);
+            }
+            
+            throw new BotFaultException(this, $"No intent filter volunteered to analyze input '{input}'.");
         }
 
         private async Task<Bot> AutoDimBulbs()
         {
-            throw new NotImplementedException();
+            var nextBrain = await _brain.AutoDimBulbs();
+            return WithBrain(nextBrain);
         }
 
         private async Task<Bot> DispatchIntent(IIntent intent)
         {
-            throw new NotImplementedException();
+            var nextBrain = await _brain.DispatchIntent(intent);
+            return WithBrain(nextBrain);
         }
 
-        private async Task<(IBulb bulb, Bot withSchedule)> ScheduleNextBulb()
+        private Task<IBulb> ScheduleNextBulb()
         {
-            throw new NotImplementedException();
+            return _brain.ScheduleNextBulb();
         }
 
         private async Task<Bot> ActUponNextBulb(IBulb nextBulb)
         {
-            throw new NotImplementedException();
+            var nextBrain = await _brain.ActUponBulb(nextBulb);
+            return WithBrain(nextBrain);
+        }
+
+        private async Task<Brain> InvokeBulbTriggerFilters(BulbTriggerInvocation invocation)
+        {
+            IBulbTriggerContext triggerContext = new BulbTriggerContext(_brain);
+
+            foreach (var trigger in _bulbTriggers)
+            {
+                triggerContext = await invocation(trigger, triggerContext);
+            }
+
+            return triggerContext.Brain;
         }
 
         private Bot WithBrain(Brain newBrain)
         {
-            return new Bot(_channels, _bulbTriggers, _cancel, newBrain, _status, _fault);
+            return new Bot(_channels, _intentFilters, _bulbTriggers, _cancel, newBrain, _status, _fault);
         }
 
         private Bot WithStatus(BotStatus newStatus)
         {
-            return new Bot(_channels, _bulbTriggers, _cancel, _brain, newStatus, _fault);
+            return new Bot(_channels, _intentFilters, _bulbTriggers, _cancel, _brain, newStatus, _fault);
         }
 
         private Bot WithFault(Exception newFault)
         {
-            return new Bot(_channels, _bulbTriggers, _cancel, _brain, _status, newFault);
+            return new Bot(_channels, _intentFilters, _bulbTriggers, _cancel, _brain, _status, newFault);
         }
 
         private static async Task<Bot> FinishedOrFaulted(Bot current, Func<Bot, Task<Bot>> action)
@@ -178,6 +218,37 @@ namespace NWheels.UI.ChatBot.Runtime.Dotnet
             }
 
             return finished;
+        }
+
+        private delegate Task<IBulbTriggerContext> BulbTriggerInvocation(
+            IBulbTriggerFilter trigger,
+            IBulbTriggerContext context);
+
+        private class BulbContext : IBulbContext
+        {
+            public BulbContext(Bot bot, IBulb thisBulb)
+            {
+                this.Bot = bot;
+                this.ThisBulb = thisBulb;
+            }
+
+            public Task<IBulbContext> Light(IBulb bulb, int? intensity = null, int? autoDimBy = null)
+            {
+                throw new System.NotImplementedException();
+            }
+
+            public Task<IBulbContext> Adjust(IBulb bulb, int? intensity = null, int? autoDimBy = null)
+            {
+                throw new System.NotImplementedException();
+            }
+
+            public Task<IBulbContext> EmitEffect(IEffect effect, IEnumerable<IChannel> limitToChannels = null)
+            {
+                throw new System.NotImplementedException();
+            }
+
+            public Bot Bot { get; }
+            public IBulb ThisBulb { get; }
         }
     }
 }
