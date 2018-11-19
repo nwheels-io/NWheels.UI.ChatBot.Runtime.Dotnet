@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using NWheels.UI.ChatBot.Runtime.Dotnet.Abstractions;
@@ -11,14 +12,14 @@ namespace NWheels.UI.ChatBot.Runtime.Dotnet
 {
     public class Bot
     {
-        private readonly ImmutableList<IChannel> _channels;
-        private readonly ImmutableList<IIntentFilter> _intentFilters;
-        private readonly ImmutableList<IBulbTriggerFilter> _bulbTriggers;
-        private readonly CancellationToken _cancel;
-        private readonly Brain _brain;
-        private readonly BotStatus _status;
-        private readonly Exception _fault;
-
+        public readonly ImmutableList<IChannel> Channels;
+        public readonly ImmutableList<IIntentFilter> IntentFilters;
+        public readonly ImmutableList<IBulbTriggerFilter> BulbTriggers;
+        public readonly CancellationToken Cancel;
+        public readonly Brain Brain;
+        public readonly BotStatus Status;
+        public readonly Exception Fault;
+        
         public Bot(
             IEnumerable<IChannel> channels, 
             IEnumerable<IIntentFilter> intentFilters,
@@ -43,13 +44,13 @@ namespace NWheels.UI.ChatBot.Runtime.Dotnet
             BotStatus status, 
             Exception fault)
         {
-            _channels = channels;
-            _intentFilters = intentFilters;
-            _bulbTriggers = bulbTriggers;
-            _cancel = cancel;
-            _brain = brain;
-            _status = status;
-            _fault = fault;
+            this.Channels = channels;
+            this.IntentFilters = intentFilters;
+            this.BulbTriggers = bulbTriggers;
+            this.Cancel = cancel;
+            this.Brain = brain;
+            this.Status = status;
+            this.Fault = fault;
         }
 
         public async Task<Bot> Start(CancellationToken cancel)
@@ -87,16 +88,13 @@ namespace NWheels.UI.ChatBot.Runtime.Dotnet
             return WithBrain(nextBrain);
         }
 
-        public BotStatus Status => _status;
-        public Exception Fault => _fault;
-
         private async Task<Bot> RunMainLoop()
         {
             var bot = this;
 
             while (bot.Status == BotStatus.Ready)
             {
-                if (!_cancel.IsCancellationRequested)
+                if (!Cancel.IsCancellationRequested)
                 {
                     bot = await FinishedOrFaulted(bot, b => b.NextMainLoopIteration());
                 }
@@ -123,7 +121,7 @@ namespace NWheels.UI.ChatBot.Runtime.Dotnet
 
         private async Task<(IInput input, Bot withInput)> PullNextInput()
         {
-            var allChannelPulls = _channels.Select(c => c.WaitForInput()).ToArray();
+            var allChannelPulls = Channels.Select(c => c.WaitForInput(Cancel)).ToArray();
             var pullInput = (await Task.WhenAny(allChannelPulls)).Result;
             var input = await pullInput();
             
@@ -135,7 +133,7 @@ namespace NWheels.UI.ChatBot.Runtime.Dotnet
 
         private async Task<(IIntent intent, Bot withIntent)> PullNextIntent(IInput input)
         {
-            var volunteer = _intentFilters.FirstOrDefault(filter => filter.WillAnalyzeInput(input));
+            var volunteer = IntentFilters.FirstOrDefault(filter => filter.WillAnalyzeInput(input));
 
             if (volunteer != null)
             {
@@ -152,32 +150,33 @@ namespace NWheels.UI.ChatBot.Runtime.Dotnet
 
         private async Task<Bot> AutoDimBulbs()
         {
-            var nextBrain = await _brain.AutoDimBulbs();
+            var nextBrain = await Brain.AutoDimBulbs();
             return WithBrain(nextBrain);
         }
 
         private async Task<Bot> DispatchIntent(IIntent intent)
         {
-            var nextBrain = await _brain.DispatchIntent(intent);
+            var nextBrain = await Brain.DispatchIntent(intent);
             return WithBrain(nextBrain);
         }
 
         private Task<IBulb> ScheduleNextBulb()
         {
-            return _brain.ScheduleNextBulb();
+            return Brain.ScheduleNextBulb();
         }
 
         private async Task<Bot> ActUponNextBulb(IBulb nextBulb)
         {
-            var nextBrain = await _brain.ActUponBulb(nextBulb);
-            return WithBrain(nextBrain);
+            var context = new BulbContext(this, nextBulb);
+            var nextContext = await nextBulb.Act(context);
+            return ((BulbContext)nextContext).Bot;
         }
 
         private async Task<Brain> InvokeBulbTriggerFilters(BulbTriggerInvocation invocation)
         {
-            IBulbTriggerContext triggerContext = new BulbTriggerContext(_brain);
+            IBulbTriggerContext triggerContext = new BulbTriggerContext(Brain);
 
-            foreach (var trigger in _bulbTriggers)
+            foreach (var trigger in BulbTriggers)
             {
                 triggerContext = await invocation(trigger, triggerContext);
             }
@@ -187,17 +186,17 @@ namespace NWheels.UI.ChatBot.Runtime.Dotnet
 
         private Bot WithBrain(Brain newBrain)
         {
-            return new Bot(_channels, _intentFilters, _bulbTriggers, _cancel, newBrain, _status, _fault);
+            return new Bot(Channels, IntentFilters, BulbTriggers, Cancel, newBrain, Status, Fault);
         }
 
         private Bot WithStatus(BotStatus newStatus)
         {
-            return new Bot(_channels, _intentFilters, _bulbTriggers, _cancel, _brain, newStatus, _fault);
+            return new Bot(Channels, IntentFilters, BulbTriggers, Cancel, Brain, newStatus, Fault);
         }
 
         private Bot WithFault(Exception newFault)
         {
-            return new Bot(_channels, _intentFilters, _bulbTriggers, _cancel, _brain, _status, newFault);
+            return new Bot(Channels, IntentFilters, BulbTriggers, Cancel, Brain, Status, newFault);
         }
 
         private static async Task<Bot> FinishedOrFaulted(Bot current, Func<Bot, Task<Bot>> action)
@@ -211,6 +210,10 @@ namespace NWheels.UI.ChatBot.Runtime.Dotnet
             catch (OperationCanceledException)
             {
                 finished = current.WithStatus(BotStatus.Aborted);
+            }
+            catch (BotFaultException e)
+            {
+                finished = e.Bot.WithStatus(BotStatus.Faulted).WithFault(e);
             }
             catch (Exception e)
             {
@@ -232,19 +235,35 @@ namespace NWheels.UI.ChatBot.Runtime.Dotnet
                 this.ThisBulb = thisBulb;
             }
 
-            public Task<IBulbContext> Light(IBulb bulb, int? intensity = null, int? autoDimBy = null)
+            public async Task<IBulbContext> UseBrain(Func<Brain, Task<Brain>> action)
             {
-                throw new System.NotImplementedException();
+                var nextBrain = await action(Bot.Brain);
+                var nextBot = (nextBrain != Bot.Brain ? Bot.WithBrain(nextBrain) : Bot);
+                var nextContext = (nextBot != Bot ? new BulbContext(nextBot, ThisBulb) : this);
+
+                return nextContext;
             }
 
-            public Task<IBulbContext> Adjust(IBulb bulb, int? intensity = null, int? autoDimBy = null)
+            public Task<IBulbContext> ListenFor<TIntent>(IntentListenMode mode) where TIntent : IIntent
             {
-                throw new System.NotImplementedException();
+                throw new NotImplementedException();
+                /*
+                var nextBrain = await action(Bot.Brain);
+                var nextBot = (nextBrain != Bot.Brain ? Bot.WithBrain(nextBrain) : Bot);
+                var nextContext = (nextBot != Bot ? new BulbContext(nextBot, ThisBulb) : this);
+
+                return nextContext;
+                */
             }
 
-            public Task<IBulbContext> EmitEffect(IEffect effect, IEnumerable<IChannel> limitToChannels = null)
+            public async Task EmitEffect(IEffect effect, IEnumerable<IChannel> limitToChannels = null)
             {
-                throw new System.NotImplementedException();
+                var targetChannelSet = (limitToChannels ?? Bot.Channels).ToImmutableList();
+                
+                foreach (var channel in targetChannelSet)
+                {
+                    await channel.EmitEffect(effect, Bot.Cancel);
+                }
             }
 
             public Bot Bot { get; }

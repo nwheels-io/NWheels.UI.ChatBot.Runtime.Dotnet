@@ -5,9 +5,17 @@ namespace NWheels.UI.ChatBot.Runtime.Dotnet
 {
     public abstract class BulbBase : IBulb
     {
-        Task IBulb.Act()
+        public Task<IBulbContext> Act(IBulbContext context)
         {
             throw new System.NotImplementedException();
         }
+
+        public Task<IBulb> Adjust(int? intensity = null, int? autoDimBy = null)
+        {
+            throw new System.NotImplementedException();
+        }
+
+        public int Intensity { get; }
+        public int AutoDimBy { get; }
     }
 }
